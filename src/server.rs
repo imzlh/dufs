@@ -10,9 +10,8 @@ use crate::Args;
 
 use anyhow::{anyhow, Result};
 use async_zip::{tokio::write::ZipFileWriter, Compression, ZipDateTime, ZipEntryBuilder};
-use base64::{engine::general_purpose::STANDARD, Engine as _};
 use bytes::Bytes;
-use chrono::{LocalResult, TimeZone, Utc};
+use chrono::{DateTime, LocalResult, TimeZone, Utc};
 use futures_util::{pin_mut, TryStreamExt};
 use headers::{
     AcceptRanges, AccessControlAllowCredentials, AccessControlAllowOrigin, CacheControl,
@@ -65,7 +64,6 @@ const RESUMABLE_UPLOAD_MIN_SIZE: u64 = 20971520; // 20M
 
 pub struct Server {
     args: Args,
-    assets_prefix: String,
     html: Cow<'static, str>,
     single_file_req_paths: Vec<String>,
     running: Arc<AtomicBool>,
@@ -73,7 +71,6 @@ pub struct Server {
 
 impl Server {
     pub fn init(args: Args, running: Arc<AtomicBool>) -> Result<Self> {
-        let assets_prefix = format!("__dufs_v{}__/", env!("CARGO_PKG_VERSION"));
         let single_file_req_paths = if args.path_is_file {
             vec![
                 args.uri_prefix.to_string(),
@@ -95,7 +92,6 @@ impl Server {
             args,
             running,
             single_file_req_paths,
-            assets_prefix,
             html,
         })
     }
@@ -106,7 +102,6 @@ impl Server {
         addr: Option<SocketAddr>,
     ) -> Result<Response, hyper::Error> {
         let uri = req.uri().clone();
-        let assets_prefix = &self.assets_prefix;
         let enable_cors = self.args.enable_cors;
         let is_microsoft_webdav = req
             .headers()
@@ -122,7 +117,7 @@ impl Server {
         let mut res = match self.clone().handle(req, is_microsoft_webdav).await {
             Ok(res) => {
                 http_log_data.insert("status".to_string(), res.status().as_u16().to_string());
-                if !uri.path().starts_with(assets_prefix) {
+                if !uri.path().starts_with("@static/") {
                     self.args.http_logger.log(&http_log_data, None);
                 }
                 res
@@ -735,7 +730,7 @@ impl Server {
         headers: &HeaderMap<HeaderValue>,
         res: &mut Response,
     ) -> Result<bool> {
-        if let Some(name) = req_path.strip_prefix(&self.assets_prefix) {
+        if let Some(name) = req_path.strip_prefix("@static/") {
             match self.args.assets.as_ref() {
                 Some(assets_path) => {
                     let path = assets_path.join(name);
@@ -932,14 +927,10 @@ impl Server {
         };
         res.headers_mut()
             .typed_insert(ContentType::from(mime_guess::mime::TEXT_HTML_UTF_8));
-        let index_data = STANDARD.encode(serde_json::to_string(&data)?);
+        let index_data = serde_json::to_string(&data)?;
         let output = self
             .html
-            .replace(
-                "__ASSETS_PREFIX__",
-                &format!("{}{}", self.args.uri_prefix, self.assets_prefix),
-            )
-            .replace("__INDEX_DATA__", &index_data);
+            .replace("<container/>", &index_data);
         res.headers_mut()
             .typed_insert(ContentLength(output.as_bytes().len() as u64));
         if head_only {
@@ -1160,6 +1151,7 @@ impl Server {
             "/{}",
             normalize_path(path.strip_prefix(&self.args.serve_path)?)
         );
+        let href_2_owner = href.clone();
         let readwrite = access_paths.perm().readwrite();
         let data = IndexData {
             kind: DataKind::Index,
@@ -1182,13 +1174,9 @@ impl Server {
             res.headers_mut()
                 .typed_insert(ContentType::from(mime_guess::mime::TEXT_HTML_UTF_8));
 
-            let index_data = STANDARD.encode(serde_json::to_string(&data)?);
+            let index_data = Server::compile_index_string(data.paths, href_2_owner);
             self.html
-                .replace(
-                    "__ASSETS_PREFIX__",
-                    &format!("{}{}", self.args.uri_prefix, self.assets_prefix),
-                )
-                .replace("__INDEX_DATA__", &index_data)
+                .replace("<container/>", &index_data)
         };
         res.headers_mut()
             .typed_insert(ContentLength(output.as_bytes().len() as u64));
@@ -1203,6 +1191,67 @@ impl Server {
         }
         *res.body_mut() = body_full(output);
         Ok(())
+    }
+
+    fn format_size(size: u64) -> String{
+        const SZ: u64 = 1024;
+        if size < SZ {
+            size.to_string() + "B"
+        }else if size < SZ * SZ {
+            (size / SZ).to_string() + "KB"
+        }else if size < SZ * SZ * SZ {
+            (size / SZ / SZ).to_string() + "MB"
+        }else if size < SZ * SZ * SZ * SZ {
+            (size / SZ / SZ / SZ).to_string() + "GB"
+        }else {
+            (size / SZ / SZ / SZ / SZ).to_string() + "TB"
+        }
+    }
+
+    fn compile_index_string(data: Vec<PathItem>, path: String) -> String{
+        let mut str: String = String::from("<bread>");
+        let paths = path.trim_end_matches("/").split("/");
+        let mut current = String::from('/');
+
+        for path in paths {
+            if path != "" {
+                current += path;
+                current += "/";
+            }
+            str += format!(
+                "<a href=\"{}\">{}/</a>",
+                current,
+                path
+            ).as_str();
+        }
+
+        str += "</bread><box><h><hi>名称</hi><hi>大小</hi><hi>修改日期</hi></h>";
+
+        for item in data {
+            if let PathType::Dir = item.path_type{
+                str += format!(
+                    "<d><a href=\"{}\">{}</a><c>-</c><c>-</c></d>",
+                    urlencoding::encode(item.name.as_str()).to_string() + "/",
+                    item.name
+                ).as_str()
+            }else{
+                str += format!(
+                    "<f><a href=\"{}\">{}</a><c>{}</c><c>{}</c></f>",
+                    urlencoding::encode(item.name.as_str()),
+                    item.name,
+                    Server::format_size(if let Some(sz) = item.size { sz } else { 0 }),
+                    // if let std::option::Option::Some(sz) = item.mtime { 
+                    match item.size {
+                        Some(size) => DateTime::from_timestamp_millis(size as i64)
+                            .unwrap()
+                            .format("%Y-%m-%d %H:%M").to_string(),
+                        None => '0'.to_string()
+                    }
+                ).as_str()
+            }
+        }
+
+        str + "</box>"
     }
 
     fn auth_reject(&self, res: &mut Response) -> Result<()> {
